@@ -1,0 +1,127 @@
+#version 460
+
+#include "../../../src/gpu/memory.glsl"
+#include "../../../src/gpu/noise.glsl"
+#define ISOSURFACE_MESHING_PUSH_CONSTANT
+#include "../../../src/shared/push.inl"
+
+float evaluate(float3 world_pos) {
+  const float3 seed = float3(0.0, 0.0, 0.0);
+  
+	// [-0.97, 1.25] ~ 0.14
+	float density =
+		snoise(seed + world_pos * 0.008) +
+		snoise(seed + world_pos * 0.008 *  2.0 +  2.85) * 0.5 +
+		snoise(seed + world_pos * 0.008 *  4.0 +  7.45) * 0.25 +
+		snoise(seed + world_pos * 0.008 * 16.0 + 24.95) * 0.0625;
+
+	return density < 0.0 ? -1.0 : 1.0;
+}
+
+#define VERTEX_COUNTS McVertexCountLUT(McPtrTable(pMcPtrTable).pVertexCounts)
+#define CONFIGURATIONS McConfigurationLUT(McPtrTable(pMcPtrTable).pConfigurations)
+#define EDGES McEdgesTriangleAssemblyLUT(McPtrTable(pMcPtrTable).pEdges)
+#define POINTS McPointsTriangleAssemblyLUT(McPtrTable(pMcPtrTable).pPoints)
+
+#define tm_WaveSize (32)
+#define tm_NumWaves (512/tm_WaveSize)
+
+shared u32 sh_subgroup_vertex_counts[tm_NumWaves];
+shared u32 sh_workgroup_vertex_idx;
+
+// Definitely should refactor to make smaller?
+// Kind of seems like the shader is a bit to large.
+// Maybe WG size 512 isn't that good either.
+
+numthreads(8, 8, 8)
+void main() {
+  u323 threadID = gl_GlobalInvocationID;
+  u323 groupThreadID = gl_LocalInvocationID;
+  u32 groupThreadIndex = gl_LocalInvocationIndex;
+
+  if(groupThreadIndex == 0) {
+    for(i32 i = 0; i < tm_NumWaves; i++) {
+      sh_subgroup_vertex_counts[i] = 0;
+    }
+    sh_workgroup_vertex_idx = 0;
+  }
+
+  barrier();
+  memoryBarrierShared();
+  int3 chunk_pos = chunk_pos.xyz;
+  int3 voxel_pos = chunk_pos*int3(COUNT_VOXELS_X, COUNT_VOXELS_Y, COUNT_VOXELS_Z) + int3(groupThreadID);
+
+  // If -1.0, fully inside  surface
+  // If  1.0, fully outside surface
+	
+  i32 voxel_index = 0;
+  for(i32 i = 0; i < 8; i++) {
+
+    // Inside surface?
+    if(evaluate(float3( voxel_pos + int3(POINTS[i].xyz) )) < 0.0) voxel_index |= 1 << i;
+
+  }
+
+  bool skip = (voxel_index == 0) || (voxel_index == 255);
+  
+  u32 vertex_count = skip ? 0 : VERTEX_COUNTS[voxel_index];
+  
+  u32 subgroup_vertex_idx = subgroupExclusiveAdd(vertex_count);
+  u32 highest_activeID = subgroupBallotFindMSB(subgroupBallot(true));
+
+  if(highestActiveID == gl_SubgroupInvocationID) {  
+    sh_subgroup_vertex_counts[groupThreadIndex/tm_WaveSize] = subgroup_vertex_idx+vertex_count;
+  }
+
+  barrier();
+  memoryBarrierShared();
+
+  if(groupThreadIndex == 0) {
+    u32 workgroup_vertex_count = 0;
+    for(i32 i = 0; i < tm_NumWaves; i++) {
+      workgroup_vertex_count += sh_subgroup_vertex_counts[i];
+    }
+    
+    if(workgroup_vertex_count > 0) {
+      sh_workgroup_vertex_idx = atomicMalloc(pAllocator, workgroup_vertex_count);
+      
+      // Refactoring...
+      pIndirect[atomicAdd(GpuGlobals(pGpuGlobals).mc_chunks_indirect_cmd_count, 1)] =
+        VkDrawIndirectCommand(workgroup_vertex_count, 1, sh_workgroup_vertex_idx, 0);
+    }
+  }
+
+  barrier();
+  memoryBarrierShared();
+
+
+  if(!skip) {
+
+  u32 vertex_offset = 0;
+  for(i32 i = 1; i <= groupThreadIndex/tm_WaveSize; i++) {
+    vertex_offset += sh_subgroup_vertex_counts[i-1];
+  }
+  
+  u32 thread_vertex_offset = vertex_offset+subgroup_vertex_idx;
+  u32 thread_first_vertex = sh_workgroup_vertex_idx+thread_vertex_offset;
+
+  for(i32 i = 0; i < vertex_count; i++) {
+    i32 t = CONFIGURATIONS[i + voxel_index*15];
+    if(t < 0) break;
+    int2 edge_indices = EDGES[ t ];
+
+    float3 v0 = float3(POINTS[edge_indices.x].xyz);
+    float3 v1 = float3(POINTS[edge_indices.y].xyz);
+
+    float3 fin0 = v0 + float3(voxel_pos);
+    float3 fin1 = v1 + float3(voxel_pos);
+
+    // interpolate vertices
+    float3 fin = (fin0 + fin1) * 0.5;
+
+    deref(Vertex(pVertices[thread_first_vertex+i])) = float4(fin, float(voxel_index)/255.0);
+  }
+  
+  } // if(!empty)
+
+} //main

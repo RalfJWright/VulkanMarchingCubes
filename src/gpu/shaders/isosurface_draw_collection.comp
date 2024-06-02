@@ -1,0 +1,12 @@
+#version 460
+
+#include "../../../src/gpu/noise.glsl"
+#define ISOSURFACE_DRAW_COLLECTION_PUSH_CONSTANT
+#include "../../../src/shared/push.inl"
+
+numthreads(8, 8, 8)
+void main() {
+	int3 idx = int3(gl_GlobalInvocationID);
+	
+	uint2 info = deref(ChunkDrawInfo(pChunkDrawInfo[flatten(idx, 8)]));
+}

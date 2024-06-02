@@ -1,0 +1,11 @@
+#version 460
+
+#include "../../../src/gpu/noise.glsl"
+#define ISOSURFACE_GENERATION_PUSH_CONSTANT
+#include "../../../src/shared/push.inl"
+
+numthreads(8, 8, 8)
+void main() {
+	int3 gtID = int3(gl_LocalInvocationID);
+	deref(Voxel(pVoxels[fromcoord(gtID, chunk_pos.xyz)])) = gtID.y < 5 ? -1.0 : 1.0;
+}
